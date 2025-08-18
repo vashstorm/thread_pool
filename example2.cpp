@@ -10,6 +10,7 @@
  * ***************************************************************/
 #include "thread_pool.h"
 #include <iostream>
+#include <thread>
 using namespace std;
 
 struct Sqtr {

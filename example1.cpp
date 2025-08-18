@@ -9,20 +9,29 @@
  * Last Modified :
  * ***************************************************************/
 #include "thread_pool.h"
+#include <exception>
 #include <iostream>
+#include <stdexcept>
+#include <thread>
 using namespace std;
 
 int main(int argc, char* argv[]) {
-    ThreadPool pool(4, 10);
-    vector<future<int>> vec;
-    int count = 16;
-    vector<int> params(16, 0);
+    ThreadPool pool(1, 32);
+    vector<future<tuple<int, int>>> vec;
+    int count = 40;
     for (int i = 0; i < count; i++) {
-        auto& param = params[i];
-        auto fut = pool.spawn([&param, i] {
+        auto fut = pool.spawn([i] {
             this_thread::sleep_for(2s);
-            param = i*i;
-            return param;
+            switch (i % 3) {
+                case 0: {
+                    throw runtime_error("task error " + to_string(i));
+                }
+                case 1: {
+                    throw logic_error("task error " + to_string(i));
+                }
+                default:
+                    return make_tuple(i, i * i);
+            }
         });
         if (fut.has_value()) {
             vec.push_back(std::move(fut.value()));
@@ -31,20 +40,29 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    pool.set_worker_count(4);
+
     for (auto& f : vec) {
         try {
-            cout << "future get " << f.get() << endl;
+            auto [i, j] = f.get();
+            cout << "future get " << i << ":" << j
+                 << " task size: " << pool.get_task_count() << endl;
+
+        } catch (const runtime_error& e) {
+            cout << "future get runtime_error" << " " << e.what() << endl;
+        } catch (const logic_error& e) {
+            cout << "future get logic_error" << " " << e.what() << endl;
         } catch (const exception& e) {
-            cout << "future get " << e.what() << endl;
+            cout << "future get exception" << " " << e.what() << endl;
         }
     }
 
     cout << "----------------------------\n";
 
-    cout << "[";
-    for (int size = count; auto& param : params) {
-        cout << param << (--size ? ", " : "]\n");
-    }
+    // cout << "[";
+    // for (auto size = count; auto& param : params) {
+    //     cout << param << (--size ? ", " : "]\n");
+    // }
 
     return 0;
 }
