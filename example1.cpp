@@ -33,7 +33,7 @@ int main(int argc, char* argv[]) {
                     return make_tuple(i, i * i);
             }
         });
-        if (fut.has_value()) {
+        if (fut) {
             vec.push_back(std::move(fut.value()));
         } else {
             cout << "task " << i << " is rejected" << endl;
@@ -63,6 +63,6 @@ int main(int argc, char* argv[]) {
     // for (auto size = count; auto& param : params) {
     //     cout << param << (--size ? ", " : "]\n");
     // }
-
+    pool.shutdown();
     return 0;
 }
