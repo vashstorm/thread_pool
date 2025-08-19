@@ -11,7 +11,6 @@
 #include <limits>
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <queue>
 #include <thread>
 #include <type_traits>
@@ -26,7 +25,7 @@ using ThreadPoolFunction = std::function<void()>;
 
 class ThreadPool {
 public:
-    explicit ThreadPool(size_t thread_number, size_t queue_size = 1024);
+    explicit ThreadPool(size_t thread_number = 0, size_t queue_size = 1024);
 
     template <typename F, typename... Args>
     auto spawn(F&& f, Args&&... args)
@@ -49,48 +48,32 @@ public:
 
     ~ThreadPool();
 private:
-    struct Worker {
-        std::thread th;
-        std::atomic_bool work_quit {false};
-
-        bool is_quit() const {
-            return work_quit.load(std::memory_order_acquire);
-        }
-    };
-
     void create_new_worker();
-    std::vector<std::unique_ptr<Worker>> workers_;
+    std::vector<std::jthread> workers_;
     std::queue<ThreadPoolFunction> tasks_;
     size_t queue_size_;
     std::atomic_bool quit_ {false};
     mutable std::mutex mtx_;
-    std::condition_variable cond_ {};
+    std::condition_variable_any cond_ {};
 };
 
 inline void ThreadPool::create_new_worker() {
-    // Create a new Worker on the heap to ensure a stable address while the
-    // thread captures its pointer
-    workers_.emplace_back(std::make_unique<Worker>());
-    Worker* wp = workers_.back().get();
-
-    wp->th = std::thread([this, wp] {
+    workers_.emplace_back([this](std::stop_token st) {
         while (true) {
             ThreadPoolFunction task;
             {
                 std::unique_lock lock(this->mtx_);
-                this->cond_.wait(lock, [this, wp] {
-                    return this->is_quit() || !this->tasks_.empty()
-                           || wp->is_quit();
+                this->cond_.wait(lock, st, [this, &st] {
+                    return st.stop_requested() || this->is_quit()
+                           || !this->tasks_.empty();
                 });
 
-                // Shrink on demand: if this worker is marked to quit, exit the
-                // loop/thread immediately
-                if (wp->is_quit()) {
+                if (st.stop_requested()) {
                     break;
                 }
 
-                // Global shutdown: if quitting and the task queue is empty,
-                // exit; otherwise keep draining the queue
+                // During global shutdown, keep draining the task queue; exit
+                // after the queue becomes empty
                 if (this->is_quit() && this->tasks_.empty()) {
                     break;
                 }
@@ -98,7 +81,6 @@ inline void ThreadPool::create_new_worker() {
                 task = std::move(this->tasks_.front());
                 this->tasks_.pop();
             }
-
             task();
         }
     });
@@ -108,14 +90,14 @@ inline void ThreadPool::shutdown() {
     {
         std::lock_guard lock(mtx_);
         quit_.store(true, std::memory_order_release);
-        for (const auto& w : workers_) {
-            w->work_quit.store(true, std::memory_order_release);
-        }
     }
+    // Wake up all threads to continue draining the queue; they will exit after
+    // the queue becomes empty
     cond_.notify_all();
-    for (const auto& w : workers_) {
-        if (w->th.joinable()) {
-            w->th.join();
+
+    for (auto& jt : workers_) {
+        if (jt.joinable()) {
+            jt.join();
         }
     }
     workers_.clear();
@@ -126,8 +108,11 @@ inline void ThreadPool::shutdown_async() {
     cond_.notify_all();
 }
 
-inline ThreadPool::ThreadPool(const size_t thread_number,
-    const size_t queue_size) : queue_size_(queue_size) {
+inline ThreadPool::ThreadPool(size_t thread_number, size_t queue_size) :
+    queue_size_(queue_size) {
+    if (thread_number <= 0) {
+        thread_number = std::thread::hardware_concurrency();
+    }
     workers_.reserve(thread_number);
     std::lock_guard lock(mtx_);
     for (size_t i = 0; i < thread_number; i++) {
@@ -146,19 +131,19 @@ auto ThreadPool::spawn(F&& f, Args&&... args)
 
     // Use shared_ptr to keep the task copyable so it is compatible when
     // ThreadPoolFunction is std::function
-    auto new_task = std::make_shared<std::packaged_task<R()>>(
+    auto task = std::make_shared<std::packaged_task<R()>>(
         [func = std::forward<F>(f), ... largs = std::forward<Args>(args)] {
             return std::invoke(func, largs...);
         });
 
-    auto result = new_task->get_future();
+    auto result = task->get_future();
     {
         std::lock_guard lock(mtx_);
         if (tasks_.size() >= queue_size_) {
             return std::unexpected("ThreadPool task queue is full");
         }
         // create a new lambda function to capture the task
-        tasks_.emplace([task = std::move(new_task)] { (*task)(); });
+        tasks_.emplace([task = std::move(task)] { (*task)(); });
     }
     cond_.notify_one();
     return result;
@@ -167,9 +152,9 @@ auto ThreadPool::spawn(F&& f, Args&&... args)
 inline ThreadPool::~ThreadPool() {
     quit_.store(true, std::memory_order_release);
     cond_.notify_all();
-    for (const auto& w : workers_) {
-        if (w->th.joinable()) {
-            w->th.join();
+    for (auto& jt : workers_) {
+        if (jt.joinable()) {
+            jt.join();
         }
     }
 }
@@ -212,36 +197,34 @@ inline void ThreadPool::set_worker_count(size_t new_size) {
     new_size = std::clamp(new_size, static_cast<size_t>(1),
         std::numeric_limits<size_t>::max() / 2);
 
-    // Temporarily hold workers to be reclaimed to keep them alive until their
-    // threads exit
-    std::vector<std::unique_ptr<Worker>> to_join;
+    // Temporarily store threads to stop; join them after releasing the lock
+    std::vector<std::jthread> to_join;
     {
         std::lock_guard lock(mtx_);
-        if (const size_t current_size = workers_.size();
-            new_size > current_size) {
+        const size_t current_size = workers_.size();
+        if (new_size > current_size) {
             workers_.reserve(new_size);
-            for (size_t i = current_size; i < new_size; i++) {
+            for (size_t i = current_size; i < new_size; ++i) {
                 create_new_worker();
             }
         } else if (new_size < current_size) {
             const size_t remove_count = current_size - new_size;
             to_join.reserve(remove_count);
             for (size_t i = 0; i < remove_count; ++i) {
-                auto& up = workers_.back();
-                up->work_quit.store(true, std::memory_order_release);
-                // Transfer ownership to to_join to avoid dangling references
-                to_join.push_back(std::move(up));
+                std::jthread jt = std::move(workers_.back());
                 workers_.pop_back();
+                // Request this worker to stop immediately
+                jt.request_stop();
+                to_join.push_back(std::move(jt));
             }
         }
     }
-    // Notify all workers so that marked threads can exit promptly
+    // Wake waiting threads so they can respond promptly
     cond_.notify_all();
-    // Wait for target threads to exit without holding the lock, then destroy
-    // corresponding Workers
-    for (const auto& w : to_join) {
-        if (w->th.joinable()) {
-            w->th.join();
+
+    for (auto& jt : to_join) {
+        if (jt.joinable()) {
+            jt.join();
         }
     }
 }
