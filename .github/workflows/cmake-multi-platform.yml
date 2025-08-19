@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+    branches:
+      - "**"
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Linux: install GCC 13 to ensure full C++23 support (std::expected, etc.)
+      - name: Install toolchain (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y g++-13
+        shell: bash
+
+      # Configure on Linux/macOS with explicit compilers
+      - name: Configure (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          set -eux
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            export CC=gcc-13
+            export CXX=g++-13
+          else
+            export CC=clang
+            export CXX=clang++
+          fi
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER="$CC" -DCMAKE_CXX_COMPILER="$CXX"
+        shell: bash
+
+      - name: Build (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          set -eux
+          cmake --build build --config Release -- -j 2
+        shell: bash
+
+      # Windows: use MSVC from Visual Studio image; don't override compilers
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+        shell: pwsh
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cmake --build build --config Release
+        shell: pwsh
